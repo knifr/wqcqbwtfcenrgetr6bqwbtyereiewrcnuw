@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Speed Up Audio</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:#fff;--card:#f2f1f7;--text:#1a1822;--hint:#6e6a7c;--accent:#6d3cf0;--on-accent:#fff;--bad:#c62828;--good:#1b7f3b}
+@media (prefers-color-scheme:dark){:root{--bg:#121018;--card:#1d1a27;--text:#f1eff7;--hint:#9d98b0;--accent:#8c63ff;--bad:#ff8a80;--good:#7be495}}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--tg-theme-bg-color,var(--bg));color:var(--tg-theme-text-color,var(--text));padding:env(safe-area-inset-top,0) 0 env(safe-area-inset-bottom,0)}
+main{max-width:520px;margin:0 auto;padding:24px 18px 40px}
+h1{font-size:28px;line-height:1.1;margin:0 0 4px;letter-spacing:-.02em}
+p{margin:0}
+.lead,.hint{color:var(--tg-theme-hint-color,var(--hint))}
+.hint{font-size:14px}
+.tabs{display:flex;gap:6px;overflow-x:auto;margin:18px -18px 0;padding:0 18px 4px}
+.tabs button{flex:none;font:inherit;font-weight:600;border:0;border-radius:999px;padding:8px 16px;cursor:pointer;background:var(--tg-theme-secondary-bg-color,var(--card));color:var(--tg-theme-text-color,var(--text))}
+.tabs button.on{background:var(--tg-theme-button-color,var(--accent));color:var(--tg-theme-button-text-color,var(--on-accent))}
+.panel{margin-top:18px;display:grid;gap:12px}
+.panel[hidden],[hidden]{display:none}
+.card{background:var(--tg-theme-secondary-bg-color,var(--card));border-radius:14px;padding:14px 16px;display:grid;gap:10px}
+label{display:grid;gap:4px;font-size:14px;color:var(--tg-theme-hint-color,var(--hint))}
+input[type=text],input[type=number],textarea{font:inherit;width:100%;padding:11px 12px;border-radius:10px;border:1px solid transparent;background:var(--tg-theme-bg-color,var(--bg));color:var(--tg-theme-text-color,var(--text))}
+textarea{min-height:90px;resize:vertical}
+input[type=file]{font:inherit;font-size:14px;max-width:100%}
+.btn{appearance:none;border:0;width:100%;font:inherit;font-weight:600;text-align:left;padding:13px 16px;border-radius:12px;cursor:pointer;background:var(--tg-theme-secondary-bg-color,var(--card));color:var(--tg-theme-text-color,var(--text))}
+.btn.main{background:var(--tg-theme-button-color,var(--accent));color:var(--tg-theme-button-text-color,var(--on-accent));text-align:center}
+.btn:disabled{opacity:.55}
+.btn:focus-visible,.tabs button:focus-visible,.chip:focus-visible{outline:3px solid var(--tg-theme-button-color,var(--accent));outline-offset:2px}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{font:inherit;font-size:14px;border:0;border-radius:8px;padding:6px 10px;cursor:pointer;background:var(--tg-theme-bg-color,var(--bg));color:var(--tg-theme-text-color,var(--text))}
+.chip.on{background:var(--tg-theme-button-color,var(--accent));color:var(--tg-theme-button-text-color,var(--on-accent))}
+.check{display:flex;align-items:center;gap:8px;color:var(--tg-theme-text-color,var(--text));font-size:16px}
+.stack{display:grid;gap:10px}
+.status{font-size:14px;min-height:1.2em}
+.status.err{color:var(--bad)}.status.ok{color:var(--good)}
+.banner{background:var(--tg-theme-secondary-bg-color,var(--card));border-radius:12px;padding:12px 14px;margin-top:14px;font-size:14px}
+code{display:block;word-break:break-all;font:13px/1.4 ui-monospace,Menlo,Consolas,monospace}
+</style>
+</head>
+<body>
+<main>
+  <h1>Speed Up Audio</h1>
+  <p class="lead">Музыка, ремиксы, теги и кружки. Готовые файлы приходят в чат с ботом.</p>
+  <div class="banner" id="banner" hidden></div>
+
+  <nav class="tabs" id="tabs">
+    <button class="on" data-tab="search">Поиск</button>
+    <button data-tab="fx">Эффекты</button>
+    <button data-tab="circle">Кружок</button>
+    <button data-tab="donate">Донат</button>
+    <button data-tab="post" id="tab-post" hidden>Пост</button>
+  </nav>
+
+  <section class="panel" id="p-search">
+    <div class="card">
+      <label>Название песни или ссылка на видео
+        <input type="text" id="q" placeholder="Например: Artist - Track" autocomplete="off">
+      </label>
+      <button class="btn main" id="go-search">Найти</button>
+      <p class="status" id="st-search"></p>
+      <div class="stack" id="results"></div>
+    </div>
+    <div class="card">
+      <label>Или загрузи голосовое, аудио или видео, где играет песня
+        <input type="file" id="find-file" accept="audio/*,video/*">
+      </label>
+      <button class="btn main" id="go-find">Узнать песню</button>
+      <p class="status" id="st-find"></p>
+    </div>
+  </section>
+
+  <section class="panel" id="p-fx" hidden>
+    <div class="card">
+      <label>Аудиофайл
+        <input type="file" id="fx-audio" accept="audio/*">
+      </label>
+      <label>Исполнитель <input type="text" id="fx-artist"></label>
+      <label>Название <input type="text" id="fx-title"></label>
+      <label>Обложка (необязательно)
+        <input type="file" id="fx-cover" accept="image/*">
+      </label>
+      <div>
+        <p class="hint">Скорость: меньше 1 это slowed, больше 1 это speed up</p>
+        <div class="chips" id="chips"></div>
+      </div>
+      <label>Своя скорость (0.25 – 3)
+        <input type="number" id="speed" min="0.25" max="3" step="0.05" value="1" inputmode="decimal">
+      </label>
+      <label class="check"><input type="checkbox" id="rev"> Reverb</label>
+      <label class="check"><input type="checkbox" id="eightd"> 8D (лучше в наушниках)</label>
+      <button class="btn main" id="go-fx">Создать</button>
+      <p class="status" id="st-fx"></p>
+    </div>
+  </section>
+
+  <section class="panel" id="p-circle" hidden>
+    <div class="card">
+      <p class="hint">Бот вырежет квадрат по центру кадра. Кружок длится до 60 секунд, длиннее видео обрежется.</p>
+      <label>Видео
+        <input type="file" id="circle-file" accept="video/*">
+      </label>
+      <button class="btn main" id="go-circle">Сделать кружок</button>
+      <p class="status" id="st-circle"></p>
+    </div>
+  </section>
+
+  <section class="panel" id="p-donate" hidden>
+    <div class="stack">
+      <button class="btn main" data-link="__DONATIONALERTS__">DonationAlerts</button>
+      <button class="btn" data-link="__YOOMONEY__">ЮMoney</button>
+      <div class="card">
+        <strong>Крипта (TON)</strong>
+        <code>__CRYPTO__</code>
+        <button class="btn" id="copy" data-copy="__CRYPTO__">Скопировать адрес</button>
+      </div>
+      <button class="btn" data-link="__SPEEDUP__">Канал Speed Up Audio</button>
+      <button class="btn" data-link="__TIPOKE__">Канал Tipoke Music</button>
+    </div>
+  </section>
+
+  <section class="panel" id="p-post" hidden>
+    <div class="card">
+      <label>Текст поста <textarea id="post-text"></textarea></label>
+      <label>Кнопки, по одной строке на ряд: Текст - https://ссылка (несколько в ряду через |)
+        <textarea id="post-buttons" placeholder="Канал - https://t.me/speedupaudioe"></textarea>
+      </label>
+      <label>Фото, видео, аудио или файл (необязательно)
+        <input type="file" id="post-media">
+      </label>
+      <button class="btn main" id="go-post">Опубликовать в канал</button>
+      <p class="status" id="st-post"></p>
+    </div>
+  </section>
+</main>
+<script>
+const $ = (s) => document.querySelector(s);
+const tg = window.Telegram && window.Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const MAX_MB = 40;
+
+async function api(path, init) {
+  init = init || {};
+  init.headers = Object.assign({ "X-Init-Data": tg ? tg.initData : "" }, init.headers || {});
+  try { return await (await fetch(path, init)).json(); }
+  catch (e) { return { error: "Нет связи с сервером. Попробуй ещё раз." }; }
+}
+const asJson = (o) => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(o) });
+function asForm(o) {
+  const fd = new FormData();
+  for (const k in o) if (o[k] !== null && o[k] !== undefined && o[k] !== "") fd.append(k, o[k]);
+  return { method: "POST", body: fd };
+}
+function say(id, text, kind) { const el = $("#" + id); el.textContent = text; el.className = "status " + (kind || ""); }
+
+async function runJob(path, init, st) {
+  say(st, "Отправляю на сервер…");
+  const r = await api(path, init);
+  if (r.error) return say(st, r.error, "err");
+  for (let i = 0; i < 120; i++) {
+    await sleep(2000);
+    const j = await api("/api/job/" + r.job);
+    if (j.status === "done") {
+      const name = [j.artist, j.title].filter(Boolean).join(" - ");
+      if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
+      return say(st, "Готово" + (name ? ": " + name : "") + ". Отправил в чат с ботом.", "ok");
+    }
+    if (j.error) return say(st, j.error, "err");
+    say(st, "Обрабатываю, это может занять до минуты…");
+  }
+  say(st, "Слишком долго. Проверь чат с ботом или попробуй ещё раз.", "err");
+}
+function bind(sel, fn) {
+  const b = $(sel);
+  b.addEventListener("click", async () => { b.disabled = true; try { await fn(); } finally { b.disabled = false; } });
+}
+function pickFile(id, st) {
+  const f = $(id).files[0];
+  if (!f) { say(st, "Выбери файл", "err"); return null; }
+  if (f.size > MAX_MB * 1024 * 1024) { say(st, "Файл больше " + MAX_MB + " МБ", "err"); return null; }
+  return f;
+}
+
+document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => {
+  document.querySelectorAll("#tabs button").forEach((x) => x.classList.toggle("on", x === b));
+  document.querySelectorAll(".panel").forEach((p) => { p.hidden = p.id !== "p-" + b.dataset.tab; });
+}));
+
+/* Поиск */
+bind("#go-search", async () => {
+  const q = $("#q").value.trim();
+  $("#results").innerHTML = "";
+  if (!q) return say("st-search", "Введи название или вставь ссылку", "err");
+  if (/^https?:\/\//i.test(q)) return runJob("/api/find", asForm({ url: q }), "st-search");
+  say("st-search", "Ищу…");
+  const r = await api("/api/search", asJson({ query: q }));
+  if (r.error) return say("st-search", r.error, "err");
+  if (!r.results.length) return say("st-search", "Ничего не нашёл", "err");
+  say("st-search", "Выбери трек, и я пришлю его в чат:");
+  r.results.forEach((it) => {
+    const b = document.createElement("button");
+    b.className = "btn";
+    const d = it.duration ? " (" + Math.floor(it.duration / 60) + ":" + String(Math.floor(it.duration % 60)).padStart(2, "0") + ")" : "";
+    b.textContent = (it.src === "soundcloud" ? "☁️ " : "▶️ ") + it.title + d;
+    b.addEventListener("click", () => runJob("/api/download", asJson({ key: it.key }), "st-search"));
+    $("#results").appendChild(b);
+  });
+});
+bind("#go-find", async () => {
+  const f = pickFile("#find-file", "st-find");
+  if (f) await runJob("/api/find", asForm({ media: f }), "st-find");
+});
+
+/* Эффекты, теги, обложка */
+function markChips() {
+  const v = parseFloat($("#speed").value);
+  document.querySelectorAll(".chip").forEach((c) => c.classList.toggle("on", parseFloat(c.dataset.v) === v));
+}
+[0.5, 0.6, 0.7, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2].forEach((v) => {
+  const c = document.createElement("button");
+  c.type = "button"; c.className = "chip"; c.dataset.v = v; c.textContent = v + "x";
+  c.addEventListener("click", () => { $("#speed").value = v; markChips(); });
+  $("#chips").appendChild(c);
+});
+$("#speed").addEventListener("input", markChips);
+markChips();
+$("#fx-audio").addEventListener("change", (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const stem = f.name.replace(/\.[^.]+$/, ""), i = stem.indexOf(" - ");
+  $("#fx-artist").value = i > 0 ? stem.slice(0, i).trim() : "";
+  $("#fx-title").value = i > 0 ? stem.slice(i + 3).trim() : stem;
+});
+bind("#go-fx", async () => {
+  const audio = pickFile("#fx-audio", "st-fx");
+  if (!audio) return;
+  const cover = $("#fx-cover").files[0] || null;
+  await runJob("/api/remix", asForm({
+    audio: audio, cover: cover, title: $("#fx-title").value.trim(), artist: $("#fx-artist").value.trim(),
+    speed: $("#speed").value, reverb: $("#rev").checked ? 1 : 0, eightd: $("#eightd").checked ? 1 : 0,
+  }), "st-fx");
+});
+
+/* Кружок */
+bind("#go-circle", async () => {
+  const f = pickFile("#circle-file", "st-circle");
+  if (f) await runJob("/api/circle", asForm({ video: f }), "st-circle");
+});
+
+/* Пост в канал (для админов) */
+bind("#go-post", async () => {
+  const media = $("#post-media").files[0] || null;
+  if (media && media.size > MAX_MB * 1024 * 1024) return say("st-post", "Файл больше " + MAX_MB + " МБ", "err");
+  await runJob("/api/post", asForm({ text: $("#post-text").value.trim(), buttons: $("#post-buttons").value.trim(), media: media }), "st-post");
+});
+
+/* Донат */
+function openUrl(url) {
+  if (tg && /^https:\/\/t\.me\//.test(url)) tg.openTelegramLink(url);
+  else if (tg) tg.openLink(url);
+  else window.open(url, "_blank");
+}
+document.querySelectorAll("[data-link]").forEach((b) => b.addEventListener("click", () => openUrl(b.dataset.link)));
+const copyBtn = $("#copy");
+copyBtn.addEventListener("click", async () => {
+  const text = copyBtn.dataset.copy;
+  try { await navigator.clipboard.writeText(text); }
+  catch (e) {
+    const t = document.createElement("textarea");
+    t.value = text; document.body.appendChild(t); t.select(); document.execCommand("copy"); t.remove();
+  }
+  copyBtn.textContent = "Адрес скопирован";
+  if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
+  setTimeout(() => { copyBtn.textContent = "Скопировать адрес"; }, 2000);
+});
+
+/* Кто открыл приложение */
+(async () => {
+  const me = await api("/api/me");
+  if (me.error) { $("#banner").hidden = false; $("#banner").textContent = me.error; return; }
+  if (me.admin) $("#tab-post").hidden = false;
+})();
+</script>
+</body>
+</html>
