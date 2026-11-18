@@ -25,15 +25,17 @@ from urllib.parse import parse_qsl
 
 import aiohttp
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.exceptions import (TelegramAPIError, TelegramBadRequest, TelegramForbiddenError,
+                                TelegramRetryAfter)
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (BotCommand, CallbackQuery, FSInputFile, InlineKeyboardButton,
-                           InlineKeyboardMarkup, Message, WebAppInfo)
+                           InlineKeyboardMarkup, Message, MessageOriginChannel, WebAppInfo)
+from aiogram.types import ChatMemberUpdated
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 from shazamio import Shazam
@@ -48,13 +50,9 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise SystemExit("Не задан BOT_TOKEN. Скопируй .env.example в .env и впиши токен.")
 
-# Канал для постов (@username или числовой id вида -100...) и админы бота (id через запятую)
-_ch = os.getenv("CHANNEL_ID", "").strip()
-try:
-    CHANNEL_ID: int | str = int(_ch)
-except ValueError:
-    CHANNEL_ID = _ch
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
+# Секрет для запуска рекламной рассылки: отправь его боту обычным сообщением.
+# Хранится только в переменной окружения, в репозиторий его не пиши.
+BROADCAST_SECRET = os.getenv("BROADCAST_SECRET", "")
 
 # Подпись под каждым отправленным треком
 SPEEDUP_URL = "https://t.me/speedupaudioe"
@@ -100,6 +98,106 @@ dp = Dispatcher()
 shazam = Shazam()
 
 
+class Store:
+    """Хранит пользователей бота, отписки от рассылки и подключённый канал.
+
+    С Upstash Redis (UPSTASH_REDIS_REST_URL и UPSTASH_REDIS_REST_TOKEN) данные переживают
+    перезапуски. Без него всё лежит в data.json, а на бесплатном Render этот файл
+    пропадает при каждом перезапуске.
+    """
+
+    def __init__(self) -> None:
+        self.url = os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/")
+        self.token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+        self.remote = bool(self.url and self.token)
+        self.file = Path(os.getenv("DATA_FILE", "data.json"))
+        self.local: dict = {"users": [], "optout": [], "channels": []}
+        if not self.remote and self.file.exists():
+            try:
+                self.local.update(json.loads(self.file.read_text(encoding="utf-8")))
+            except Exception:
+                logging.warning("не удалось прочитать %s", self.file)
+
+    async def _cmd(self, *args):
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.post(self.url, json=[str(a) for a in args],
+                                 headers={"Authorization": f"Bearer {self.token}"}) as r:
+                data = await r.json()
+        if data.get("error"):
+            raise RuntimeError(data["error"])
+        return data.get("result")
+
+    def _save(self) -> None:
+        try:
+            self.file.write_text(json.dumps(self.local), encoding="utf-8")
+        except OSError:
+            logging.warning("не удалось записать %s", self.file)
+
+    async def _add(self, key: str, uid: int) -> None:
+        if self.remote:
+            await self._cmd("SADD", key, uid)
+        elif uid not in self.local[key]:
+            self.local[key].append(uid)
+            self._save()
+
+    async def _remove(self, key: str, uid: int) -> None:
+        if self.remote:
+            await self._cmd("SREM", key, uid)
+        elif uid in self.local[key]:
+            self.local[key].remove(uid)
+            self._save()
+
+    async def add_user(self, uid: int) -> None:
+        await self._add("users", uid)
+
+    async def remove_user(self, uid: int) -> None:
+        await self._remove("users", uid)
+
+    async def set_optout(self, uid: int, flag: bool) -> None:
+        await (self._add if flag else self._remove)("optout", uid)
+
+    async def recipients(self) -> list[int]:
+        if self.remote:
+            users = await self._cmd("SMEMBERS", "users") or []
+            optout = await self._cmd("SMEMBERS", "optout") or []
+        else:
+            users, optout = self.local["users"], self.local["optout"]
+        skip = {int(x) for x in optout}
+        return [int(u) for u in users if int(u) not in skip]
+
+    async def add_channel(self, cid: int) -> None:
+        await self._add("channels", cid)
+
+    async def remove_channel(self, cid: int) -> None:
+        await self._remove("channels", cid)
+
+    async def channels(self) -> list[int]:
+        raw = (await self._cmd("SMEMBERS", "channels") or []) if self.remote else self.local["channels"]
+        return [int(x) for x in raw]
+
+
+store = Store()
+SEEN: set[int] = set()   # кого уже записали в этом запуске
+
+
+class TrackUsers(BaseMiddleware):
+    """Запоминает всех, кто написал боту в личку (для рассылки)."""
+    async def __call__(self, handler, event, data):
+        user, chat = event.from_user, event.chat
+        if user and not user.is_bot and chat.type == "private" and user.id not in SEEN:
+            SEEN.add(user.id)
+            try:
+                await store.add_user(user.id)
+            except Exception:
+                SEEN.discard(user.id)
+                logging.warning("store.add_user failed", exc_info=True)
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(TrackUsers())
+
+
 class Fx(StatesGroup):
     custom_speed = State()
     tags = State()
@@ -107,6 +205,7 @@ class Fx(StatesGroup):
 
 
 class Post(StatesGroup):
+    channel = State()
     content = State()
     buttons = State()
     confirm = State()
@@ -552,7 +651,8 @@ async def start(message: Message, state: FSMContext):
         "• <b>аудиофайл</b> — сделаю эффекты, поменяю теги и обложку\n"
         "• <b>голосовое, видео, кружок или ссылку</b> — найду песню и пришлю аудио\n"
         "• <b>название</b> — найду трек и пришлю аудио\n"
-        "• <b>картинку с подписью</b> после аудио — быстро поменяю теги и обложку",
+        "• <b>картинку с подписью</b> после аудио — быстро поменяю теги и обложку\n\n"
+        "Отписаться от рекламной рассылки: /stopads",
         reply_markup=start_kb(),
     )
 
@@ -666,16 +766,6 @@ async def on_circle_wrong(message: Message):
 
 # =====================  ПОСТЫ В КАНАЛ  =====================
 
-def post_ready(user_id: int) -> str | None:
-    """Возвращает текст ошибки или None, если всё готово."""
-    if not CHANNEL_ID or not ADMIN_IDS:
-        return ("Посты не настроены. Укажи переменные окружения CHANNEL_ID (канал) "
-                "и ADMIN_IDS (твой Telegram id, узнать можно у @userinfobot).")
-    if user_id not in ADMIN_IDS:
-        return "Эта функция доступна только админам бота."
-    return None
-
-
 def rows_to_kb(rows: list | None) -> InlineKeyboardMarkup | None:
     if not rows:
         return None
@@ -704,23 +794,210 @@ def parse_buttons(text: str) -> list | None:
     return rows or None
 
 
-async def begin_post(message: Message, user_id: int, state: FSMContext) -> None:
-    error = post_ready(user_id)
-    if error:
-        await message.answer(error)
-        return
-    await state.clear()
+async def user_channels(bot: Bot, user_id: int) -> list[tuple[int, str]]:
+    """Каналы, где бот админ и пользователь тоже админ с правом публикации."""
+    result: list[tuple[int, str]] = []
+    try:
+        ids = await store.channels()
+    except Exception:
+        logging.warning("store.channels failed", exc_info=True)
+        return result
+    for cid in ids:
+        try:
+            member = await bot.get_chat_member(cid, user_id)
+            if member.status not in ("creator", "administrator"):
+                continue
+            if member.status == "administrator" and not getattr(member, "can_post_messages", False):
+                continue
+            chat = await bot.get_chat(cid)
+            result.append((cid, chat.title or str(cid)))
+        except TelegramAPIError:
+            continue
+    return result
+
+
+async def ask_channel(message: Message, state: FSMContext) -> None:
+    await state.set_state(Post.channel)
+    await message.answer(
+        "📢 <b>Подключение канала</b>\n\n"
+        "1. Сделай меня админом канала (с правом «Публикация сообщений»).\n"
+        "2. Перешли сюда любой пост из этого канала.\n\n"
+        "И всё! Если пересылка запрещена, напиши @username канала.\n\nОтмена: /cancel"
+    )
+
+
+async def ask_post_content(message: Message, state: FSMContext, title: str) -> None:
     await state.set_state(Post.content)
     await message.answer(
-        f"📢 Пост в <b>{html.escape(str(CHANNEL_ID))}</b>\n\n"
-        "Пришли сам пост: текст, фото, видео, аудио или файл (с подписью, если нужна). "
-        "Форматирование сохранится.\n\nОтмена: /cancel"
+        f"📢 Пост в <b>{html.escape(title)}</b>\n\n"
+        "Пришли пост: текст, фото, видео, аудио или файл (с подписью, если нужна). "
+        "Форматирование сохранится. Дальше добавим кнопки.\n\nОтмена: /cancel"
     )
+
+
+async def begin_post(message: Message, user_id: int, state: FSMContext) -> None:
+    await state.clear()
+    channels = await user_channels(message.bot, user_id)
+    if not channels:
+        await ask_channel(message, state)
+    elif len(channels) == 1:
+        cid, title = channels[0]
+        await state.update_data(channel=cid, channel_title=title)
+        await ask_post_content(message, state, title)
+    else:
+        await state.set_state(Post.channel)
+        b = InlineKeyboardBuilder()
+        for cid, title in channels:
+            b.row(InlineKeyboardButton(text=title[:40], callback_data=f"post:ch:{cid}"))
+        await message.answer("В какой канал публикуем?", reply_markup=b.as_markup())
+
+
+@dp.callback_query(Post.channel, F.data.startswith("post:ch:"))
+async def post_choose_channel(cb: CallbackQuery, state: FSMContext):
+    cid = int(cb.data.rsplit(":", 1)[1])
+    chosen = next(((c, t) for c, t in await user_channels(cb.bot, cb.from_user.id) if c == cid), None)
+    if not chosen:
+        await cb.answer("Нет доступа к этому каналу", show_alert=True)
+        return
+    await cb.answer()
+    await state.update_data(channel=cid, channel_title=chosen[1])
+    await ask_post_content(cb.message, state, chosen[1])
+
+
+@dp.message(Command("channel"))
+async def cmd_channel(message: Message, state: FSMContext):
+    await state.clear()
+    await ask_channel(message, state)
+
+
+@dp.my_chat_member()
+async def on_bot_status(event: ChatMemberUpdated, bot: Bot):
+    """Бота сделали админом канала (или сняли): запоминаем канал автоматически."""
+    if event.chat.type != "channel":
+        return
+    new = event.new_chat_member
+    try:
+        if new.status == "administrator" and getattr(new, "can_post_messages", False):
+            await store.add_channel(event.chat.id)
+            try:
+                await bot.send_message(
+                    event.from_user.id,
+                    f"✅ Канал <b>{html.escape(event.chat.title or '')}</b> подключён. "
+                    "Чтобы сделать пост с кнопками, отправь /post")
+            except TelegramAPIError:
+                pass                                 # человек ещё не запускал бота
+        else:
+            await store.remove_channel(event.chat.id)
+    except Exception:
+        logging.warning("channel update failed", exc_info=True)
 
 
 @dp.message(Command("post"))
 async def cmd_post(message: Message, state: FSMContext):
     await begin_post(message, message.from_user.id, state)
+
+
+@dp.message(Post.channel)
+async def post_channel(message: Message, state: FSMContext, bot: Bot):
+    chat = None
+    origin = message.forward_origin
+    try:
+        if isinstance(origin, MessageOriginChannel):
+            chat = origin.chat
+        elif message.text and re.fullmatch(r"@\w{4,}|-100\d+", message.text.strip()):
+            chat = await bot.get_chat(message.text.strip())
+    except TelegramAPIError:
+        chat = None
+    if not chat:
+        await message.reply("Перешли сюда пост из канала (не копию) или напиши @username канала. "
+                            "Отмена: /cancel")
+        return
+    try:
+        me = await bot.get_chat_member(chat.id, bot.id)
+        bot_ok = me.status == "administrator" and bool(getattr(me, "can_post_messages", False))
+        you = await bot.get_chat_member(chat.id, message.from_user.id)
+        you_ok = you.status in ("creator", "administrator")
+    except TelegramAPIError:
+        bot_ok = you_ok = False
+    if not bot_ok:
+        await message.reply("Я пока не админ этого канала или у меня нет права публикации. "
+                            "Сделай меня админом с правом «Публикация сообщений» и перешли пост ещё раз.")
+        return
+    if not you_ok:
+        await message.reply("Постить в канал могут только его админы.")
+        return
+    await store.add_channel(chat.id)
+    await state.update_data(channel=chat.id, channel_title=chat.title or str(chat.id))
+    note = "" if store.remote else ("\n\nПодсказка: без хранилища (Upstash) после перезапуска бота "
+                                    "канал придётся подключить заново: перешли один пост, и всё.")
+    await message.answer(f"✅ Канал подключён: <b>{html.escape(chat.title or str(chat.id))}</b>{note}")
+    await ask_post_content(message, state, chat.title or str(chat.id))
+
+
+async def run_broadcast(bot: Bot, admin_chat: int, data: dict) -> None:
+    ids = await store.recipients()
+    kb = rows_to_kb(data.get("rows"))
+    ok = blocked = failed = 0
+    for uid in ids:
+        try:
+            try:
+                await bot.copy_message(uid, data["src_chat"], data["src_msg"], reply_markup=kb)
+            except TelegramRetryAfter as e:          # Telegram просит притормозить
+                await asyncio.sleep(e.retry_after + 1)
+                await bot.copy_message(uid, data["src_chat"], data["src_msg"], reply_markup=kb)
+            ok += 1
+        except TelegramForbiddenError:               # пользователь заблокировал бота
+            blocked += 1
+            try:
+                await store.remove_user(uid)
+            except Exception:
+                pass
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)                    # не больше ~20 сообщений в секунду
+    await bot.send_message(admin_chat, "✅ Рассылка завершена.\n"
+                                       f"Доставлено: {ok}\nЗаблокировали бота: {blocked}\nОшибок: {failed}")
+
+
+def _is_secret(message: Message) -> bool:
+    return bool(BROADCAST_SECRET and message.text and
+                hmac.compare_digest(message.text.strip().encode(), BROADCAST_SECRET.encode()))
+
+
+@dp.message(F.text, _is_secret)
+async def on_secret(message: Message, state: FSMContext):
+    try:
+        await message.delete()                       # убираем пароль из переписки
+    except TelegramAPIError:
+        pass
+    await state.clear()
+    await state.set_state(Post.content)
+    await state.update_data(target="users")
+    try:
+        count = str(len(await store.recipients()))
+    except Exception:
+        count = "?"
+    await message.answer(
+        f"📣 <b>Рассылка</b>\n\nПолучателей: <b>{count}</b> (те, кто запускал бота и не отписался).\n\n"
+        "Пришли рекламное сообщение: текст, фото, видео или аудио. Потом можно добавить кнопки "
+        "и посмотреть превью.\n\nОтмена: /cancel")
+
+
+@dp.message(Command("id"))
+async def cmd_id(message: Message):
+    await message.answer(f"Твой Telegram ID: <code>{message.from_user.id}</code>")
+
+
+@dp.message(Command("stopads"))
+async def cmd_stopads(message: Message):
+    await store.set_optout(message.from_user.id, True)
+    await message.answer("🔕 Готово, рекламную рассылку больше не присылаю. Вернуть: /startads")
+
+
+@dp.message(Command("startads"))
+async def cmd_startads(message: Message):
+    await store.set_optout(message.from_user.id, False)
+    await message.answer("🔔 Рекламная рассылка снова включена. Отключить: /stopads")
 
 
 @dp.message(Post.content)
@@ -750,9 +1027,16 @@ async def show_preview(bot: Bot, chat_id: int, state: FSMContext) -> None:
         InlineKeyboardButton(text="✅ Опубликовать", callback_data="post:publish"),
         InlineKeyboardButton(text="❌ Отмена", callback_data="post:cancel"),
     ]])
-    await bot.send_message(chat_id, f"👆 Так пост будет выглядеть в канале "
-                                    f"<b>{html.escape(str(CHANNEL_ID))}</b>. Публикуем?",
-                           reply_markup=confirm)
+    if data.get("target") == "users":
+        try:
+            count = str(len(await store.recipients()))
+        except Exception:
+            count = "?"
+        text = f"👆 Так будет выглядеть рассылка. Получателей: <b>{count}</b>. Отправляем?"
+    else:
+        text = (f"👆 Так пост будет выглядеть в канале "
+                f"<b>{html.escape(data.get('channel_title') or '')}</b>. Публикуем?")
+    await bot.send_message(chat_id, text, reply_markup=confirm)
 
 
 @dp.message(Post.buttons, F.text)
@@ -782,21 +1066,28 @@ async def post_skip(cb: CallbackQuery, state: FSMContext, bot: Bot):
 
 @dp.callback_query(Post.confirm, F.data == "post:publish")
 async def post_publish(cb: CallbackQuery, state: FSMContext, bot: Bot):
-    if post_ready(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
-        return
     data = await state.get_data()
     await cb.answer()
+    if data.get("target") == "users":                # рассылка (доступ уже проверен секретом)
+        await state.clear()
+        await cb.message.answer("📣 Рассылка запущена. Пришлю отчёт, когда закончу.")
+        task = asyncio.create_task(run_broadcast(bot, cb.message.chat.id, data))
+        BG_TASKS.add(task)
+        task.add_done_callback(BG_TASKS.discard)
+        return
+    cid = data.get("channel")
+    if cid not in [c for c, _ in await user_channels(bot, cb.from_user.id)]:
+        await cb.message.answer("Нет доступа к каналу. Начни заново: /post")
+        return
     try:
-        await bot.copy_message(CHANNEL_ID, data["src_chat"], data["src_msg"],
+        await bot.copy_message(cid, data["src_chat"], data["src_msg"],
                                reply_markup=rows_to_kb(data.get("rows")))
         await cb.message.answer("✅ Пост опубликован!")
         await state.clear()
     except TelegramAPIError as e:
         await cb.message.answer(
             f"⚠️ Не получилось опубликовать: {html.escape(e.message)}\n\n"
-            "Проверь, что бот добавлен в канал администратором с правом публикации "
-            "и что CHANNEL_ID указан верно.")
+            "Проверь, что бот всё ещё админ канала с правом публикации.")
 
 
 # =====================  ВВОД ЗНАЧЕНИЙ (скорость / теги / обложка)  =====================
@@ -1206,7 +1497,8 @@ async def send_found(target: ChatTarget, tmp: Path, track: dict) -> dict:
 
 async def api_me(request: web.Request) -> web.Response:
     user = auth(request)
-    return web.json_response({"admin": post_ready(user["id"]) is None})
+    channels = await user_channels(request.app["bot"], user["id"])
+    return web.json_response({"channels": [{"id": c, "title": n} for c, n in channels]})
 
 
 async def api_job(request: web.Request) -> web.Response:
@@ -1304,17 +1596,24 @@ async def api_circle(request: web.Request) -> web.Response:
 
 async def api_post(request: web.Request) -> web.Response:
     user, tmp, form = await prepare_request(request)
-    problem = post_ready(user["id"])
+    bot: Bot = request.app["bot"]
+    try:
+        wanted = int(form.get("channel", ""))
+    except ValueError:
+        wanted = None
+    allowed = [c for c, _ in await user_channels(bot, user["id"])]
     rows = parse_buttons(form["buttons"]) if form.get("buttons") else None
     text = form.get("text", "")
-    if problem or (form.get("buttons") and not rows) or (not text and "media" not in form):
+    problem = None
+    if wanted not in allowed:
+        problem = ("Нет доступа к каналу. Сделай бота админом канала и отправь боту /post.", 403)
+    elif form.get("buttons") and not rows:
+        problem = ("Не разобрал кнопки. Формат строки: Текст - https://ссылка", 400)
+    elif not text and "media" not in form:
+        problem = ("Добавь текст или файл", 400)
+    if problem:
         shutil.rmtree(tmp, ignore_errors=True)
-        if problem:
-            return err(problem, 403)
-        if form.get("buttons") and not rows:
-            return err("Не разобрал кнопки. Формат строки: Текст - https://ссылка")
-        return err("Добавь текст или файл")
-    bot: Bot = request.app["bot"]
+        return err(*problem)
     kb = rows_to_kb(rows)
 
     async def work():
@@ -1324,11 +1623,150 @@ async def api_post(request: web.Request) -> web.Response:
             send = (bot.send_photo if kind.startswith("image/") else
                     bot.send_video if kind.startswith("video/") else
                     bot.send_audio if kind.startswith("audio/") else bot.send_document)
-            await send(CHANNEL_ID, f, caption=text or None, reply_markup=kb)
+            await send(wanted, f, caption=text or None, reply_markup=kb)
         else:
-            await bot.send_message(CHANNEL_ID, text, reply_markup=kb)
+            await bot.send_message(wanted, text, reply_markup=kb)
         return {"title": "пост опубликован"}
     return start_job(user["id"], tmp, work)
+
+
+# =====================  САЙТ-АДМИНКА ДЛЯ РАССЫЛКИ (/admin)  =====================
+
+ADMIN_FILE = Path(__file__).parent / "webapp" / "admin.html"
+ADMIN_JOB: dict = {"status": "idle"}
+FAILED_LOGINS: dict[str, list[float]] = {}
+
+
+def admin_auth(request: web.Request) -> None:
+    """Пароль из BROADCAST_SECRET. После 5 неверных попыток IP блокируется на 15 минут."""
+    def fail(message: str, exc):
+        return exc(text=json.dumps({"error": message}), content_type="application/json")
+    if not BROADCAST_SECRET:
+        raise fail("На сервере не задана переменная BROADCAST_SECRET", web.HTTPServiceUnavailable)
+    ip = (request.headers.get("X-Forwarded-For") or request.remote or "?").split(",")[0].strip()
+    now = time.time()
+    recent = [x for x in FAILED_LOGINS.get(ip, []) if now - x < 900]
+    FAILED_LOGINS[ip] = recent
+    if len(recent) >= 5:
+        raise fail("Слишком много попыток. Подожди 15 минут.", web.HTTPTooManyRequests)
+    given = request.headers.get("X-Admin-Password", "")
+    if not hmac.compare_digest(given.encode(), BROADCAST_SECRET.encode()):
+        recent.append(now)
+        raise fail("Неверный пароль", web.HTTPUnauthorized)
+
+
+def media_kind(content_type: str) -> str:
+    return next((k for k in ("image", "video", "audio") if content_type.startswith(k + "/")), "file")
+
+
+async def send_ad(bot: Bot, chat_id: int, text: str, kb, media, kind: str | None) -> str | None:
+    """Шлёт рекламу одному пользователю. Возвращает file_id загруженного файла (для повторной отправки)."""
+    if not media:
+        await bot.send_message(chat_id, text, reply_markup=kb)
+        return None
+    send, attr = {"image": (bot.send_photo, "photo"), "video": (bot.send_video, "video"),
+                  "audio": (bot.send_audio, "audio")}.get(kind, (bot.send_document, "document"))
+    msg = await send(chat_id, media, caption=text or None, reply_markup=kb)
+    obj = getattr(msg, attr)
+    return (obj[-1] if attr == "photo" else obj).file_id
+
+
+async def broadcast_ad(bot: Bot, job: dict, text: str, kb, media_path, media_name, kind) -> None:
+    ids = await store.recipients()
+    job.update(status="running", total=len(ids), sent=0, blocked=0, failed=0)
+    media = FSInputFile(media_path, filename=media_name) if media_path else None
+    for uid in ids:
+        for _ in range(2):
+            try:
+                file_id = await send_ad(bot, uid, text, kb, media, kind)
+                if file_id:
+                    media = file_id                  # дальше шлём по file_id, без повторной загрузки
+                job["sent"] += 1
+                break
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+            except TelegramForbiddenError:           # пользователь заблокировал бота
+                job["blocked"] += 1
+                try:
+                    await store.remove_user(uid)
+                except Exception:
+                    pass
+                break
+            except Exception:
+                job["failed"] += 1
+                break
+        else:
+            job["failed"] += 1
+        await asyncio.sleep(0.05)                    # не больше ~20 сообщений в секунду
+    job["status"] = "done"
+
+
+async def admin_page(request: web.Request) -> web.Response:
+    return web.Response(text=ADMIN_FILE.read_text(encoding="utf-8"), content_type="text/html")
+
+
+async def admin_stats(request: web.Request) -> web.Response:
+    admin_auth(request)
+    return web.json_response({"recipients": len(await store.recipients())})
+
+
+async def admin_job(request: web.Request) -> web.Response:
+    admin_auth(request)
+    return web.json_response(ADMIN_JOB)
+
+
+async def admin_send(request: web.Request) -> web.Response:
+    admin_auth(request)
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        form = await read_form(request, tmp)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    text, test_to = form.get("text", ""), form.get("test_to", "")
+    rows = parse_buttons(form["buttons"]) if form.get("buttons") else None
+    problem = None
+    if form.get("buttons") and not rows:
+        problem = "Не разобрал кнопки. Формат строки: Текст - https://ссылка"
+    elif not text and "media" not in form:
+        problem = "Добавь текст или файл"
+    elif not test_to and ADMIN_JOB.get("status") in ("starting", "running"):
+        problem = "Предыдущая рассылка ещё идёт"
+    if problem:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return err(problem)
+    bot: Bot = request.app["bot"]
+    kb = rows_to_kb(rows)
+    kind = media_kind(form.get("media_type", "")) if "media" in form else None
+    media_path, media_name = form.get("media"), form.get("media_name")
+
+    if test_to:                                      # тест: только одному получателю
+        try:
+            media = FSInputFile(media_path, filename=media_name) if media_path else None
+            await send_ad(bot, int(test_to), text, kb, media, kind)
+            return web.json_response({"ok": True})
+        except (ValueError, TelegramAPIError) as e:
+            return err(f"Не отправилось: {getattr(e, 'message', e)}. "
+                       "Проверь ID и что ты запускал бота (/start).")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    ADMIN_JOB.clear()
+    ADMIN_JOB.update(status="starting", total=0, sent=0, blocked=0, failed=0)
+
+    async def runner():
+        try:
+            await broadcast_ad(bot, ADMIN_JOB, text, kb, media_path, media_name, kind)
+        except Exception:
+            logging.exception("broadcast failed")
+            ADMIN_JOB["status"] = "error"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    task = asyncio.create_task(runner())
+    BG_TASKS.add(task)
+    task.add_done_callback(BG_TASKS.discard)
+    return web.json_response({"ok": True})
 
 
 async def webapp_page(request: web.Request) -> web.Response:
@@ -1359,6 +1797,10 @@ async def start_health_server(bot: Bot) -> None:
     app.router.add_post("/api/remix", api_remix)
     app.router.add_post("/api/circle", api_circle)
     app.router.add_post("/api/post", api_post)
+    app.router.add_get("/admin", admin_page)
+    app.router.add_post("/admin/api/stats", admin_stats)
+    app.router.add_post("/admin/api/send", admin_send)
+    app.router.add_get("/admin/api/job", admin_job)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(port)).start()
