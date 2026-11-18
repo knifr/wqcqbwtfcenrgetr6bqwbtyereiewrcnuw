@@ -52,7 +52,7 @@ if not TOKEN:
 
 # Секрет для запуска рекламной рассылки: отправь его боту обычным сообщением.
 # Хранится только в переменной окружения, в репозиторий его не пиши.
-BROADCAST_SECRET = os.getenv("BROADCAST_SECRET", "")
+BROADCAST_SECRET = os.getenv("BROADCAST_SECRET", "").strip()
 
 # Подпись под каждым отправленным треком
 SPEEDUP_URL = "https://t.me/speedupaudioe"
@@ -70,6 +70,8 @@ TONKEEPER_URL = f"https://app.tonkeeper.com/transfer/{CRYPTO_ADDRESS}"
 # из RENDER_EXTERNAL_URL (нужен Web Service), либо задай WEBAPP_URL вручную.
 _render_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 WEBAPP_URL = os.getenv("WEBAPP_URL") or (f"{_render_url}/app" if _render_url else "")
+_base_url = _render_url or (WEBAPP_URL[:-4] if WEBAPP_URL.endswith("/app") else "")
+ADMIN_URL = f"{_base_url}/admin" if _base_url else ""   # сайт-панель рекламы
 WEBAPP_FILE = Path(__file__).parent / "webapp" / "index.html"
 
 # Где искать аудио, по порядку. Если источник не работает, бот пробует следующий.
@@ -99,7 +101,7 @@ shazam = Shazam()
 
 
 class Store:
-    """Хранит пользователей бота, отписки от рассылки и подключённый канал.
+    """Хранит пользователей бота и подключённые каналы.
 
     С Upstash Redis (UPSTASH_REDIS_REST_URL и UPSTASH_REDIS_REST_TOKEN) данные переживают
     перезапуски. Без него всё лежит в data.json, а на бесплатном Render этот файл
@@ -111,7 +113,7 @@ class Store:
         self.token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
         self.remote = bool(self.url and self.token)
         self.file = Path(os.getenv("DATA_FILE", "data.json"))
-        self.local: dict = {"users": [], "optout": [], "channels": []}
+        self.local: dict = {"users": [], "channels": []}
         if not self.remote and self.file.exists():
             try:
                 self.local.update(json.loads(self.file.read_text(encoding="utf-8")))
@@ -154,17 +156,9 @@ class Store:
     async def remove_user(self, uid: int) -> None:
         await self._remove("users", uid)
 
-    async def set_optout(self, uid: int, flag: bool) -> None:
-        await (self._add if flag else self._remove)("optout", uid)
-
     async def recipients(self) -> list[int]:
-        if self.remote:
-            users = await self._cmd("SMEMBERS", "users") or []
-            optout = await self._cmd("SMEMBERS", "optout") or []
-        else:
-            users, optout = self.local["users"], self.local["optout"]
-        skip = {int(x) for x in optout}
-        return [int(u) for u in users if int(u) not in skip]
+        users = (await self._cmd("SMEMBERS", "users") or []) if self.remote else self.local["users"]
+        return [int(u) for u in users]
 
     async def add_channel(self, cid: int) -> None:
         await self._add("channels", cid)
@@ -651,8 +645,7 @@ async def start(message: Message, state: FSMContext):
         "• <b>аудиофайл</b> — сделаю эффекты, поменяю теги и обложку\n"
         "• <b>голосовое, видео, кружок или ссылку</b> — найду песню и пришлю аудио\n"
         "• <b>название</b> — найду трек и пришлю аудио\n"
-        "• <b>картинку с подписью</b> после аудио — быстро поменяю теги и обложку\n\n"
-        "Отписаться от рекламной рассылки: /stopads",
+        "• <b>картинку с подписью</b> после аудио — быстро поменяю теги и обложку",
         reply_markup=start_kb(),
     )
 
@@ -964,6 +957,9 @@ def _is_secret(message: Message) -> bool:
                 hmac.compare_digest(message.text.strip().encode(), BROADCAST_SECRET.encode()))
 
 
+AD_UNLOCKED: set[int] = set()   # кто отправил пароль (нужно для кнопки «рассылка в чате»)
+
+
 @dp.message(F.text, _is_secret)
 async def on_secret(message: Message, state: FSMContext):
     try:
@@ -971,33 +967,37 @@ async def on_secret(message: Message, state: FSMContext):
     except TelegramAPIError:
         pass
     await state.clear()
-    await state.set_state(Post.content)
-    await state.update_data(target="users")
+    AD_UNLOCKED.add(message.from_user.id)
     try:
         count = str(len(await store.recipients()))
     except Exception:
         count = "?"
-    await message.answer(
-        f"📣 <b>Рассылка</b>\n\nПолучателей: <b>{count}</b> (те, кто запускал бота и не отписался).\n\n"
-        "Пришли рекламное сообщение: текст, фото, видео или аудио. Потом можно добавить кнопки "
-        "и посмотреть превью.\n\nОтмена: /cancel")
+    b = InlineKeyboardBuilder()
+    if ADMIN_URL:
+        b.row(InlineKeyboardButton(text="🌐 Открыть панель рекламы", url=ADMIN_URL))
+    b.row(InlineKeyboardButton(text="💬 Рассылка прямо в чате", callback_data="ads:chat"))
+    where = (f"Панель на сайте: {ADMIN_URL}\nПароль для входа тот же." if ADMIN_URL else
+             "Панель на сайте: адрес твоего сервиса на Render + /admin")
+    await message.answer(f"📣 <b>Реклама</b>\n\nПолучателей: <b>{count}</b> (все, кто запускал бота).\n\n{where}",
+                         reply_markup=b.as_markup(), disable_web_page_preview=True)
+
+
+@dp.callback_query(F.data == "ads:chat")
+async def on_ads_chat(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id not in AD_UNLOCKED:
+        await cb.answer("Сначала отправь пароль", show_alert=True)
+        return
+    await cb.answer()
+    await state.clear()
+    await state.set_state(Post.content)
+    await state.update_data(target="users")
+    await cb.message.answer("Пришли рекламное сообщение: текст, фото, видео или аудио. Потом можно добавить "
+                            "кнопки и посмотреть превью.\n\nОтмена: /cancel")
 
 
 @dp.message(Command("id"))
 async def cmd_id(message: Message):
     await message.answer(f"Твой Telegram ID: <code>{message.from_user.id}</code>")
-
-
-@dp.message(Command("stopads"))
-async def cmd_stopads(message: Message):
-    await store.set_optout(message.from_user.id, True)
-    await message.answer("🔕 Готово, рекламную рассылку больше не присылаю. Вернуть: /startads")
-
-
-@dp.message(Command("startads"))
-async def cmd_startads(message: Message):
-    await store.set_optout(message.from_user.id, False)
-    await message.answer("🔔 Рекламная рассылка снова включена. Отключить: /stopads")
 
 
 @dp.message(Post.content)
@@ -1649,7 +1649,7 @@ def admin_auth(request: web.Request) -> None:
     FAILED_LOGINS[ip] = recent
     if len(recent) >= 5:
         raise fail("Слишком много попыток. Подожди 15 минут.", web.HTTPTooManyRequests)
-    given = request.headers.get("X-Admin-Password", "")
+    given = request.headers.get("X-Admin-Password", "").strip()
     if not hmac.compare_digest(given.encode(), BROADCAST_SECRET.encode()):
         recent.append(now)
         raise fail("Неверный пароль", web.HTTPUnauthorized)
@@ -1702,12 +1702,20 @@ async def broadcast_ad(bot: Bot, job: dict, text: str, kb, media_path, media_nam
 
 
 async def admin_page(request: web.Request) -> web.Response:
+    if not ADMIN_FILE.exists():
+        return web.Response(status=404, text="Нет файла webapp/admin.html: загрузи папку webapp на GitHub "
+                                             "и пересобери сервис на Render.")
     return web.Response(text=ADMIN_FILE.read_text(encoding="utf-8"), content_type="text/html")
 
 
 async def admin_stats(request: web.Request) -> web.Response:
     admin_auth(request)
-    return web.json_response({"recipients": len(await store.recipients())})
+    try:
+        return web.json_response({"recipients": len(await store.recipients())})
+    except Exception as e:
+        logging.exception("store error")
+        return web.json_response({"recipients": 0, "warning": "Хранилище недоступно: " + explain_error(e) +
+                                  ". Проверь UPSTASH_REDIS_REST_URL (https://...) и токен."})
 
 
 async def admin_job(request: web.Request) -> web.Response:
@@ -1780,12 +1788,26 @@ async def webapp_page(request: web.Request) -> web.Response:
     return web.Response(text=page, content_type="text/html")
 
 
+@web.middleware
+async def json_errors(request: web.Request, handler):
+    """Неожиданную ошибку API отдаёт понятным JSON, а не пустой страницей 500."""
+    try:
+        return await handler(request)
+    except web.HTTPException:
+        raise
+    except Exception as e:
+        logging.exception("web error")
+        if request.path.startswith(("/api/", "/admin/api/")):
+            return web.json_response({"error": f"Ошибка сервера: {explain_error(e)}"}, status=500)
+        raise
+
+
 async def start_health_server(bot: Bot) -> None:
     """Если Render задал PORT (Web Service) — поднимаем мини-сервер для health check."""
     port = os.getenv("PORT")
     if not port:
         return
-    app = web.Application()
+    app = web.Application(middlewares=[json_errors])
     app["bot"] = bot
     app.router.add_get("/", lambda request: web.Response(text="ok"))
     app.router.add_get("/app", webapp_page)
@@ -1812,7 +1834,7 @@ async def main():
         BotCommand(command="start", description="Меню функций"),
         BotCommand(command="circle", description="Видео в кружок"),
         BotCommand(command="donate", description="Поддержать проект"),
-        BotCommand(command="post", description="Пост в канал (для админов)"),
+        BotCommand(command="post", description="Пост в канал с кнопками"),
         BotCommand(command="cancel", description="Отменить текущее действие"),
     ])
     await start_health_server(bot)
