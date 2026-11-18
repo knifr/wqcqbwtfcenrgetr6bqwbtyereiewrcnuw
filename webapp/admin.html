@@ -66,8 +66,10 @@ let pwd = "";
 async function call(path, init) {
   init = init || {};
   init.headers = { "X-Admin-Password": pwd };
-  try { return await (await fetch(path, init)).json(); }
-  catch (e) { return { error: "Нет связи с сервером" }; }
+  let r;
+  try { r = await fetch(path, init); } catch (e) { return { error: "Нет связи с сервером" }; }
+  try { return await r.json(); }
+  catch (e) { return { error: "Ошибка " + r.status + (r.status === 404 ? ": на сервере старая версия бота без этой страницы" : "") }; }
 }
 function say(text, kind, id) { const e = $(id || "#st"); e.textContent = text; e.className = "status " + (kind || ""); }
 function body(extra) {
@@ -95,11 +97,11 @@ async function poll() {
   }
 }
 $("#enter").addEventListener("click", async () => {
-  pwd = $("#pwd").value;
+  pwd = $("#pwd").value.trim();
   const r = await call("/admin/api/stats", { method: "POST" });
   if (r.error) return say(r.error, "err", "#lst");
   $("#login").hidden = true; $("#panel").hidden = false;
-  $("#count").textContent = "Получателей: " + r.recipients + " (те, кто запускал бота и не отписался)";
+  $("#count").textContent = r.warning || ("Получателей: " + r.recipients + " (все, кто запускал бота)");
   poll();
 });
 $("#pwd").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#enter").click(); });
