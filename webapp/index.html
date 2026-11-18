@@ -23,7 +23,7 @@ p{margin:0}
 .panel[hidden],[hidden]{display:none}
 .card{background:var(--tg-theme-secondary-bg-color,var(--card));border-radius:14px;padding:14px 16px;display:grid;gap:10px}
 label{display:grid;gap:4px;font-size:14px;color:var(--tg-theme-hint-color,var(--hint))}
-input[type=text],input[type=number],textarea{font:inherit;width:100%;padding:11px 12px;border-radius:10px;border:1px solid transparent;background:var(--tg-theme-bg-color,var(--bg));color:var(--tg-theme-text-color,var(--text))}
+input[type=text],input[type=number],textarea,select{font:inherit;width:100%;padding:11px 12px;border-radius:10px;border:1px solid transparent;background:var(--tg-theme-bg-color,var(--bg));color:var(--tg-theme-text-color,var(--text))}
 textarea{min-height:90px;resize:vertical}
 input[type=file]{font:inherit;font-size:14px;max-width:100%}
 .btn{appearance:none;border:0;width:100%;font:inherit;font-weight:600;text-align:left;padding:13px 16px;border-radius:12px;cursor:pointer;background:var(--tg-theme-secondary-bg-color,var(--card));color:var(--tg-theme-text-color,var(--text))}
@@ -124,6 +124,7 @@ code{display:block;word-break:break-all;font:13px/1.4 ui-monospace,Menlo,Consola
 
   <section class="panel" id="p-post" hidden>
     <div class="card">
+      <label>Канал <select id="post-channel"></select></label>
       <label>Текст поста <textarea id="post-text"></textarea></label>
       <label>Кнопки, по одной строке на ряд: Текст - https://ссылка (несколько в ряду через |)
         <textarea id="post-buttons" placeholder="Канал - https://t.me/speedupaudioe"></textarea>
@@ -255,7 +256,7 @@ bind("#go-circle", async () => {
 bind("#go-post", async () => {
   const media = $("#post-media").files[0] || null;
   if (media && media.size > MAX_MB * 1024 * 1024) return say("st-post", "Файл больше " + MAX_MB + " МБ", "err");
-  await runJob("/api/post", asForm({ text: $("#post-text").value.trim(), buttons: $("#post-buttons").value.trim(), media: media }), "st-post");
+  await runJob("/api/post", asForm({ channel: $("#post-channel").value, text: $("#post-text").value.trim(), buttons: $("#post-buttons").value.trim(), media: media }), "st-post");
 });
 
 /* Донат */
@@ -282,7 +283,14 @@ copyBtn.addEventListener("click", async () => {
 (async () => {
   const me = await api("/api/me");
   if (me.error) { $("#banner").hidden = false; $("#banner").textContent = me.error; return; }
-  if (me.admin) $("#tab-post").hidden = false;
+  if (me.channels && me.channels.length) {
+    me.channels.forEach((c) => {
+      const o = document.createElement("option");
+      o.value = c.id; o.textContent = c.title;
+      $("#post-channel").appendChild(o);
+    });
+    $("#tab-post").hidden = false;
+  }
 })();
 </script>
 </body>
